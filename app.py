@@ -1,21 +1,35 @@
+import os
+from dotenv import load_dotenv
+
 import firebase_admin
 from firebase_admin import credentials, messaging
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+
 import mysql.connector
+
+
+# =========================================================
+# LOAD ENVIRONMENT VARIABLES
+# =========================================================
+
+load_dotenv()
 
 
 # =========================================================
 # FIREBASE ADMIN SDK
 # =========================================================
+import os
+import json
+import firebase_admin
+from firebase_admin import credentials
 
-cred = credentials.Certificate(
-    "ai-blood-donation-app-firebase-adminsdk-fbsvc-06745d2c73.json"
-)
+firebase_json = os.environ.get("FIREBASE_CREDENTIALS_JSON")
 
-firebase_admin.initialize_app(cred)
-
+if firebase_json and not firebase_admin._apps:
+    cred = credentials.Certificate(json.loads(firebase_json))
+    firebase_admin.initialize_app(cred)
 
 # =========================================================
 # FLASK APP
@@ -30,10 +44,11 @@ CORS(app)
 # =========================================================
 
 db = mysql.connector.connect(
-    host="localhost",
-    user="root",
-    password="kowzy@17092006",
-    database="blood_donation"
+    host=os.getenv("DB_HOST"),
+    port=int(os.getenv("DB_PORT")),
+    user=os.getenv("DB_USER"),
+    password=os.getenv("DB_PASSWORD"),
+    database=os.getenv("DB_NAME")
 )
 
 
@@ -54,6 +69,7 @@ def home():
 
 @app.route("/register-donor", methods=["POST"])
 def register_donor():
+
     try:
         data = request.get_json()
 
@@ -93,6 +109,9 @@ def register_donor():
         }), 201
 
     except Exception as e:
+
+        print("REGISTER DONOR ERROR:", e)
+
         return jsonify({
             "success": False,
             "message": str(e)
@@ -105,6 +124,7 @@ def register_donor():
 
 @app.route("/request-blood", methods=["POST"])
 def request_blood():
+
     try:
         data = request.get_json()
 
@@ -130,14 +150,21 @@ def request_blood():
 
         cursor.execute(sql, values)
         db.commit()
+
+        request_id = cursor.lastrowid
+
         cursor.close()
 
         return jsonify({
             "success": True,
-            "message": "Blood request submitted successfully"
+            "message": "Blood request submitted successfully",
+            "request_id": request_id
         }), 201
 
     except Exception as e:
+
+        print("BLOOD REQUEST ERROR:", e)
+
         return jsonify({
             "success": False,
             "message": str(e)
@@ -147,17 +174,13 @@ def request_blood():
 # =========================================================
 # 3. SEARCH DONORS
 # =========================================================
-
 @app.route("/search-donors", methods=["GET"])
 def search_donors():
-    try:
-        blood_group = request.args.get("blood_group")
 
-        if not blood_group:
-            return jsonify({
-                "success": False,
-                "message": "Blood group is required"
-            }), 400
+    try:
+        db.ping(reconnect=True, attempts=3, delay=2)
+
+        blood_group = request.args.get("blood_group")
 
         cursor = db.cursor(dictionary=True)
 
@@ -168,9 +191,10 @@ def search_donors():
             age,
             blood_group,
             phone,
-            location
+            location,
+            trust_score
         FROM donors
-        WHERE blood_group = %s
+        WHERE LOWER(blood_group) = LOWER(%s)
         """
 
         cursor.execute(sql, (blood_group,))
@@ -185,27 +209,22 @@ def search_donors():
         }), 200
 
     except Exception as e:
+
+        print("SEARCH DONORS ERROR:", e)
+
         return jsonify({
             "success": False,
             "message": str(e)
         }), 500
 
-
-# =========================================================
-# 4. SMART DONOR RECOMMENDATION
-# =========================================================
-
 @app.route("/recommend-donors", methods=["GET"])
 def recommend_donors():
-    try:
-        blood_group = request.args.get("blood_group")
-        location = request.args.get("location", "")
 
-        if not blood_group:
-            return jsonify({
-                "success": False,
-                "message": "Blood group is required"
-            }), 400
+    try:
+        db.ping(reconnect=True, attempts=3, delay=2)
+
+        blood_group = request.args.get("blood_group")
+        location = request.args.get("location")
 
         cursor = db.cursor(dictionary=True)
 
@@ -218,21 +237,13 @@ def recommend_donors():
             phone,
             location,
             trust_score,
-
             CASE
-                WHEN LOWER(location) = LOWER(%s)
-                THEN 100
+                WHEN LOWER(location) = LOWER(%s) THEN 100
                 ELSE 50
             END AS recommendation_score
-
         FROM donors
-
-        WHERE blood_group = %s
-
-        ORDER BY
-            recommendation_score DESC,
-            age ASC
-
+        WHERE LOWER(blood_group) = LOWER(%s)
+        ORDER BY recommendation_score DESC, trust_score DESC
         LIMIT 5
         """
 
@@ -251,49 +262,40 @@ def recommend_donors():
         }), 200
 
     except Exception as e:
+
+        print("RECOMMENDATION ERROR:", e)
+
         return jsonify({
             "success": False,
             "message": str(e)
         }), 500
-
-
 # =========================================================
 # 5. BLOOD DEMAND PREDICTION
 # =========================================================
 
 @app.route("/predict-demand", methods=["GET"])
 def predict_demand():
+
     try:
         blood_group = request.args.get("blood_group")
 
-        if not blood_group:
-            return jsonify({
-                "success": False,
-                "message": "Blood group is required"
-            }), 400
-
-        cursor = db.cursor(dictionary=True)
+        cursor = db.cursor()
 
         sql = """
-        SELECT COUNT(*) AS total_requests
+        SELECT COUNT(*)
         FROM blood_requests
         WHERE blood_group = %s
         """
 
-        cursor.execute(
-            sql,
-            (blood_group,)
-        )
+        cursor.execute(sql, (blood_group,))
 
-        result = cursor.fetchone()
+        count = cursor.fetchone()[0]
 
         cursor.close()
 
-        total_requests = result["total_requests"]
-
-        if total_requests >= 10:
+        if count >= 10:
             demand = "High"
-        elif total_requests >= 5:
+        elif count >= 5:
             demand = "Medium"
         else:
             demand = "Low"
@@ -301,11 +303,14 @@ def predict_demand():
         return jsonify({
             "success": True,
             "blood_group": blood_group,
-            "total_requests": total_requests,
-            "predicted_demand": demand
+            "request_count": count,
+            "demand": demand
         }), 200
 
     except Exception as e:
+
+        print("DEMAND PREDICTION ERROR:", e)
+
         return jsonify({
             "success": False,
             "message": str(e)
@@ -313,35 +318,40 @@ def predict_demand():
 
 
 # =========================================================
-# 6. BLOOD REQUESTS
+# 6. BLOOD REQUESTS - HOSPITAL DASHBOARD
 # =========================================================
 
 @app.route("/blood-requests", methods=["GET"])
 def blood_requests():
+
     try:
         cursor = db.cursor(dictionary=True)
 
         cursor.execute("""
-            SELECT
-                id,
-                patient_name,
-                blood_group,
-                hospital_name,
-                contact_number,
-                created_at
-            FROM blood_requests
-            ORDER BY created_at DESC
+        SELECT
+            id,
+            patient_name,
+            blood_group,
+            hospital_name,
+            contact_number,
+            created_at
+        FROM blood_requests
+        ORDER BY created_at DESC
         """)
 
-        requests = cursor.fetchall()
+        requests_data = cursor.fetchall()
+
         cursor.close()
 
         return jsonify({
             "success": True,
-            "requests": requests
+            "requests": requests_data
         }), 200
 
     except Exception as e:
+
+        print("BLOOD REQUESTS ERROR:", e)
+
         return jsonify({
             "success": False,
             "message": str(e)
@@ -354,19 +364,21 @@ def blood_requests():
 
 @app.route("/blood-bank-dashboard", methods=["GET"])
 def blood_bank_dashboard():
+
     try:
         cursor = db.cursor(dictionary=True)
 
         cursor.execute("""
-            SELECT
-                blood_group,
-                COUNT(*) AS donor_count
-            FROM donors
-            GROUP BY blood_group
-            ORDER BY blood_group
+        SELECT
+            blood_group,
+            COUNT(*) AS available_donors
+        FROM donors
+        GROUP BY blood_group
+        ORDER BY blood_group
         """)
 
         data = cursor.fetchall()
+
         cursor.close()
 
         return jsonify({
@@ -375,6 +387,9 @@ def blood_bank_dashboard():
         }), 200
 
     except Exception as e:
+
+        print("BLOOD BANK DASHBOARD ERROR:", e)
+
         return jsonify({
             "success": False,
             "message": str(e)
@@ -387,17 +402,12 @@ def blood_bank_dashboard():
 
 @app.route("/save-fcm-token", methods=["POST"])
 def save_fcm_token():
+
     try:
         data = request.get_json()
 
         donor_id = data.get("donor_id")
         fcm_token = data.get("fcm_token")
-
-        if not donor_id or not fcm_token:
-            return jsonify({
-                "success": False,
-                "message": "Donor ID and FCM token are required"
-            }), 400
 
         cursor = db.cursor()
 
@@ -407,7 +417,11 @@ def save_fcm_token():
         WHERE id = %s
         """
 
-        cursor.execute(sql, (fcm_token, donor_id))
+        cursor.execute(
+            sql,
+            (fcm_token, donor_id)
+        )
+
         db.commit()
 
         cursor.close()
@@ -418,6 +432,9 @@ def save_fcm_token():
         }), 200
 
     except Exception as e:
+
+        print("FCM TOKEN ERROR:", e)
+
         return jsonify({
             "success": False,
             "message": str(e)
@@ -425,11 +442,12 @@ def save_fcm_token():
 
 
 # =========================================================
-# 9. EMERGENCY BLOOD ALERT + FCM NOTIFICATION
+# 9. EMERGENCY BLOOD ALERT
 # =========================================================
 
 @app.route("/emergency-alert", methods=["POST"])
 def emergency_alert():
+
     try:
         data = request.get_json()
 
@@ -438,101 +456,71 @@ def emergency_alert():
         hospital_name = data.get("hospital_name")
         contact_number = data.get("contact_number")
 
-        if not patient_name or not blood_group or not hospital_name or not contact_number:
-            return jsonify({
-                "success": False,
-                "message": "All fields are required"
-            }), 400
+        cursor = db.cursor(dictionary=True)
 
-        # -------------------------------------------------
-        # Save emergency request
-        # -------------------------------------------------
-
-        cursor = db.cursor()
-
-        sql = """
+        # Save emergency blood request
+        insert_sql = """
         INSERT INTO blood_requests
         (patient_name, blood_group, hospital_name, contact_number)
         VALUES (%s, %s, %s, %s)
         """
 
-        cursor.execute(sql, (
-            patient_name,
-            blood_group,
-            hospital_name,
-            contact_number
-        ))
+        cursor.execute(
+            insert_sql,
+            (
+                patient_name,
+                blood_group,
+                hospital_name,
+                contact_number
+            )
+        )
 
         db.commit()
-        cursor.close()
 
-        # -------------------------------------------------
-        # Find matching donors with FCM tokens
-        # -------------------------------------------------
-
-        cursor = db.cursor(dictionary=True)
-
+        # Find donors with FCM tokens
         cursor.execute("""
-            SELECT fcm_token
-            FROM donors
-            WHERE blood_group = %s
-              AND fcm_token IS NOT NULL
-              AND fcm_token <> ''
+        SELECT fcm_token
+        FROM donors
+        WHERE blood_group = %s
+        AND fcm_token IS NOT NULL
+        AND fcm_token != ''
         """, (blood_group,))
 
-        donor_rows = cursor.fetchall()
+        donors = cursor.fetchall()
+
         cursor.close()
 
         tokens = [
-            row["fcm_token"]
-            for row in donor_rows
-            if row.get("fcm_token")
+            donor["fcm_token"]
+            for donor in donors
         ]
 
-        notifications_sent = 0
-        notifications_failed = 0
-
-        # -------------------------------------------------
-        # Send FCM notification
-        # -------------------------------------------------
+        sent_count = 0
 
         if tokens:
+
             message = messaging.MulticastMessage(
                 notification=messaging.Notification(
-                    title="🚨 Emergency Blood Alert",
-                    body=(
-                        f"Urgent {blood_group} blood required at "
-                        f"{hospital_name} for {patient_name}. "
-                        f"Please respond if you can donate."
-                    )
+                    title="Emergency Blood Request",
+                    body=f"Urgent {blood_group} blood needed at {hospital_name}"
                 ),
-                data={
-                    "type": "emergency_blood_alert",
-                    "patient_name": str(patient_name),
-                    "blood_group": str(blood_group),
-                    "hospital_name": str(hospital_name),
-                    "contact_number": str(contact_number)
-                },
                 tokens=tokens
             )
 
             response = messaging.send_each_for_multicast(message)
 
-            notifications_sent = response.success_count
-            notifications_failed = response.failure_count
-
-            print("Notifications sent:", response.success_count)
-            print("Notifications failed:", response.failure_count)
+            sent_count = response.success_count
 
         return jsonify({
             "success": True,
-            "message": "Emergency blood alert sent successfully",
-            "matching_donors": len(tokens),
-            "notifications_sent": notifications_sent,
-            "notifications_failed": notifications_failed
+            "message": "Emergency alert sent successfully",
+            "alerts_sent": sent_count
         }), 200
 
     except Exception as e:
+
+        print("EMERGENCY ALERT ERROR:", e)
+
         return jsonify({
             "success": False,
             "message": str(e)
@@ -540,10 +528,11 @@ def emergency_alert():
 
 
 # =========================================================
-# RUN FLASK SERVER
+# START FLASK SERVER
 # =========================================================
 
 if __name__ == "__main__":
+
     app.run(
         host="0.0.0.0",
         port=5000,
